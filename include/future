@@ -11,6 +11,7 @@
 #include <system_error>
 #include <mutex>
 #include <condition_variable>
+#include <functional>
 
 namespace __FUTURE_NAMESPACE
 {
@@ -20,6 +21,47 @@ namespace __future_detail
 
 template<class T>
 class associated_state
+{
+  public:
+    associated_state() = default;
+
+    associated_state(const associated_state&) = delete;
+
+    associated_state(associated_state&& other) = default;
+
+    virtual void wait() const = 0;
+
+    virtual T move_value() const = 0;
+};
+
+
+template<class Function>
+class deferred_state : public associated_state<typename std::result_of<Function()>::type>
+{
+  private:
+    using value_type = typename std::result_of<Function()>::type;
+
+    Function f_;
+
+  public:
+    template<class F>
+    explicit deferred_state(F&& f)
+      : f_(std::forward<F>(f))
+    {}
+
+    virtual void wait() const {}
+
+    virtual value_type move_value() const
+    {
+      wait();
+
+      return f_();
+    }
+};
+
+
+template<class T>
+class asynchronous_state : public associated_state<T>
 {
   private:
     mutable std::mutex                                                          mutex_;
@@ -34,9 +76,13 @@ class associated_state
     }
 
   public:
-    associated_state() : has_value_(false) {}
+    asynchronous_state()
+      : associated_state<T>(), has_value_(false)
+    {}
 
-    associated_state(const associated_state&) = delete;
+    asynchronous_state(const asynchronous_state&) = delete;
+
+    asynchronous_state(asynchronous_state&& other) = default;
 
     bool ready() const
     {
@@ -81,6 +127,11 @@ class associated_state
       }
 
       return *address_of_value();
+    }
+
+    T move_value() const
+    {
+      return std::move(get());
     }
 };
 
@@ -200,12 +251,53 @@ template<class> class promise;
 template<class R>
 class future
 {
+  private:
+    template<class T>
+    struct convert_future
+    {
+      mutable future<T> fut_;
+
+      convert_future(future<T>&& f) : fut_(std::move(f)) {}
+
+      convert_future(convert_future&& other) = default;
+
+      R operator()() const
+      {
+        return fut_.get();
+      }
+    };
+
+    template<class T>
+    using conversion_continuation = __future_detail::deferred_state<convert_future<T>>;
+
+    template<class T>
+    static conversion_continuation<T> make_conversion_continuation(future<T>&& f)
+    {
+      return conversion_continuation<T>(convert_future<T>(std::move(f)));
+    }
+
+
   public:
     future() noexcept : retrieved_(false) {};
 
     future(future&&) noexcept = default;
 
     future(const future&) = delete;
+
+    // XXX this is new
+    //     we can maybe accelerate the void case
+    template<class T>
+    future(future<T>&& other,
+           typename std::enable_if<
+             std::is_void<R>::value ||
+             std::is_constructible<R,T&&>::value
+           >::type* = 0)
+    {
+      if(other.valid())
+      {
+        state_ = std::make_shared<conversion_continuation<T>>(std::move(other));
+      }
+    }
 
     ~future() = default;
 
@@ -239,7 +331,7 @@ class future
 
       retrieved_ = true;
 
-      return state_->get();
+      return state_->move_value();
     }
 
   private:
@@ -249,11 +341,12 @@ class future
 
     future(const std::shared_ptr<__future_detail::associated_state<R>>& state)
       : state_(state)
-    {
-      std::cout << "future ctor(): state: " << state_.get() << std::endl;
-    }
+    {}
 
     friend class promise<R>;
+
+    template<class T>
+    friend class future;
 }; // end future
 
 
@@ -262,16 +355,14 @@ class promise
 {
   public:
     promise()
-      : promise(std::allocator_arg, std::allocator<__future_detail::associated_state<R>>())
+      : promise(std::allocator_arg, std::allocator<__future_detail::asynchronous_state<R>>())
     {}
 
     template<class Allocator>
     promise(std::allocator_arg_t, const Allocator& a)
-      : state_(std::allocate_shared<__future_detail::associated_state<R>>(a)),
+      : state_(std::allocate_shared<__future_detail::asynchronous_state<R>>(a)),
         future_(state_)
-    {
-      std::cout << "state allocated: " << state_.get() << std::endl;
-    }
+    {}
 
     promise(promise&& other) noexcept
       : state_(std::move(other.state_))
@@ -358,8 +449,8 @@ class promise
       set_exception(std::make_exception_ptr(future_error(future_errc::broken_promise)));
     }
 
-    std::shared_ptr<__future_detail::associated_state<R>> state_;
-    future<R>                                             future_;
+    std::shared_ptr<__future_detail::asynchronous_state<R>> state_;
+    future<R>                                               future_;
 };
 
 
